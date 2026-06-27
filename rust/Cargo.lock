@@ -6601,6 +6601,7 @@ dependencies = [
 name = "sys_tray"
 version = "0.1.0"
 dependencies = [
+ "dbus 0.9.6",
  "fluent 0.16.1",
  "fluent-ffi",
  "ksni",

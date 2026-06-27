@@ -2,13 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+use dbus::arg::{RefArg, Variant};
+use dbus::channel::Sender;
+use dbus::strings::BusName;
+use dbus::Message;
 use fluent_ffi::{FluentBundleRc, adapt_bundle_for_gecko};
 use ksni::Handle;
 use nserror::{NS_OK, nsresult};
 use nsstring::nsCString;
+use std::collections::BTreeMap;
+use std::env;
 use std::ffi::CStr;
 use std::os::raw::c_void;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::thread;
 use system_tray::{SystemTray, TrayItem, XdgIcon};
 use xpcom::interfaces::nsIPrefBranch;
@@ -40,6 +48,57 @@ fn get_bool_pref(name: &CStr) -> Option<bool> {
     Some(value)
 }
 
+fn unity_launcher_uri() -> String {
+    const FALLBACK: &str = "application://thunderbird.desktop";
+
+    let Some(launcher) = env::var_os("MOZ_APP_LAUNCHER") else {
+        return FALLBACK.to_string();
+    };
+    let Some(file_name) = Path::new(&launcher)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+    else {
+        return FALLBACK.to_string();
+    };
+
+    if file_name.ends_with(".desktop") {
+        format!("application://{file_name}")
+    } else {
+        FALLBACK.to_string()
+    }
+}
+
+fn emit_unity_launcher_count(connection: &dbus::blocking::Connection, count: u32) -> bool {
+    let mut properties: BTreeMap<&str, Variant<Box<dyn RefArg>>> = BTreeMap::new();
+    let count_value: Box<dyn RefArg> = Box::new(i64::from(count));
+    let visible_value: Box<dyn RefArg> = Box::new(count > 0);
+    properties.insert("count", Variant(count_value));
+    properties.insert("count-visible", Variant(visible_value));
+
+    let Ok(mut message) = Message::new_signal(
+        "/Unity",
+        "com.canonical.Unity.LauncherEntry",
+        "Update",
+    ) else {
+        log::debug!("Failed to create Unity launcher update signal");
+        return false;
+    };
+
+    let Ok(destination) = BusName::new("com.canonical.Unity") else {
+        log::debug!("Failed to create Unity launcher destination");
+        return false;
+    };
+    message.set_destination(Some(destination));
+
+    let message = message.append2(unity_launcher_uri(), properties);
+    if connection.send(message).is_err() {
+        log::debug!("Failed to send Unity launcher update signal");
+        return false;
+    }
+    connection.channel().flush();
+    true
+}
+
 /// Construct a new xpcom object for tray handling on Linux
 ///
 /// Note eventually this will move back into the main crate
@@ -61,6 +120,7 @@ pub unsafe extern "C" fn nsLinuxSysTrayHandlerConstructor(
 #[xpcom::xpcom(implement(nsIMessengerOSIntegration), atomic)]
 pub struct LinuxSysTrayHandler {
     handle: Handle<SystemTray>,
+    unity_connection: Mutex<Option<dbus::blocking::Connection>>,
 }
 
 impl LinuxSysTrayHandler {
@@ -115,22 +175,59 @@ impl LinuxSysTrayHandler {
                 Err(e) => log::error!("Spawning system tray FAILED: {e}"),
             });
         }
-        LinuxSysTrayHandler::allocate(InitLinuxSysTrayHandler { handle })
+        let unity_connection = match dbus::blocking::Connection::new_session() {
+            Ok(connection) => {
+                emit_unity_launcher_count(&connection, 0);
+                Some(connection)
+            }
+            Err(error) => {
+                log::debug!("Failed to connect to session bus: {error}");
+                None
+            }
+        };
+        LinuxSysTrayHandler::allocate(InitLinuxSysTrayHandler {
+            handle,
+            unity_connection: Mutex::new(unity_connection),
+        })
     }
 
-    // Update the unread method count (unimplemented as yet)
+    fn emit_unity_launcher_count(&self, count: u32) {
+        let Ok(mut connection) = self.unity_connection.lock() else {
+            return;
+        };
+        if connection.is_none() {
+            match dbus::blocking::Connection::new_session() {
+                Ok(new_connection) => *connection = Some(new_connection),
+                Err(error) => {
+                    log::debug!("Failed to connect to session bus: {error}");
+                    return;
+                }
+            }
+        }
+
+        if let Some(active_connection) = connection.as_ref() {
+            if !emit_unity_launcher_count(active_connection, count) {
+                *connection = None;
+            }
+        }
+    }
+
+    // Update the unread count badge on desktops that support the Unity launcher
+    // API, such as KDE Plasma's task manager.
     xpcom_method!(update_unread_count => UpdateUnreadCount(unreadCount: u32, unreadToolTip: *const nsstring::nsAString));
     fn update_unread_count(
         &self,
-        _count: u32,
+        count: u32,
         _tooltip: &nsstring::nsAString,
     ) -> Result<(), nsresult> {
+        self.emit_unity_launcher_count(count);
         Ok(())
     }
 
     // Handle any cleanups
     xpcom_method!(on_exit => OnExit());
     fn on_exit(&self) -> Result<(), nsresult> {
+        self.emit_unity_launcher_count(0);
         self.handle.shutdown();
         Ok(())
     }

@@ -155,8 +155,7 @@ export const MailNotificationManager = new (class {
     // system tray icon.
     this._osIntegration;
 
-    if (["macosx", "win"].includes(AppConstants.platform)) {
-      // We don't have indicator for unread count on Linux yet.
+    if (["linux", "macosx", "win"].includes(AppConstants.platform)) {
       lazy.MailNotificationService.addListener(this);
       Services.obs.addObserver(this, "unread-im-count-changed");
     }
@@ -205,7 +204,7 @@ export const MailNotificationManager = new (class {
       case "profile-before-change":
         this._osIntegration?.onExit();
 
-        if (["macosx", "win"].includes(AppConstants.platform)) {
+        if (["linux", "macosx", "win"].includes(AppConstants.platform)) {
           lazy.MailNotificationService.removeListener(this);
           Services.obs.removeObserver(this, "unread-im-count-changed");
         }
